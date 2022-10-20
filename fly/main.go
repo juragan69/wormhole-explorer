@@ -11,11 +11,12 @@ import (
 	"github.com/certusone/wormhole/node/pkg/p2p"
 	gossipv1 "github.com/certusone/wormhole/node/pkg/proto/gossip/v1"
 	"github.com/certusone/wormhole/node/pkg/supervisor"
-	"github.com/certusone/wormhole/node/pkg/vaa"
 	eth_common "github.com/ethereum/go-ethereum/common"
 	ipfslog "github.com/ipfs/go-log/v2"
 	"github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/wormhole-foundation/wormhole/sdk/vaa"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/joho/godotenv"
 	"go.mongodb.org/mongo-driver/bson"
@@ -45,7 +46,7 @@ func main() {
 	// p2pBootstrap = "/dns4/guardian-0.guardian/udp/8999/quic/p2p/12D3KooWL3XJ9EMCyZvmmGXL2LMiVBtrVa2BuESsJiXkSj7333Jw"
 	p2pPort = 8999
 	nodeKeyPath = "/tmp/node.key"
-	logLevel = "warn"
+	logLevel = "info"
 	common.SetRestrictiveUmask()
 
 	lvl, err := ipfslog.LevelFromString(logLevel)
@@ -86,6 +87,8 @@ func main() {
 	hbColl := client.Database("wormhole").Collection("heartbeats")
 	obsColl := client.Database("wormhole").Collection("observations")
 	vaaColl := client.Database("wormhole").Collection("vaas")
+	govCfgColl := client.Database("wormhole").Collection("governorCfgs")
+	govStatusColl := client.Database("wormhole").Collection("governorStatus")
 
 	// Node's main lifecycle context.
 	rootCtx, rootCtxCancel = context.WithCancel(context.Background())
@@ -104,11 +107,16 @@ func main() {
 	signedInC := make(chan *gossipv1.SignedVAAWithQuorum, 50)
 
 	// Heartbeat updates
-	heartbeatC := make(chan *gossipv1.Heartbeat, 50)
-
+	heartbeatC := make(chan *gossipv1.SignedHeartbeat, 50)
 	// Guardian set state managed by processor
-	gst := common.NewGuardianSetState(heartbeatC)
+	// gst := common.NewGuardianSetState()
+	gst := common.NewGuardianSetState()
 
+	// Governor cfg
+	govCfg := make(chan *gossipv1.SignedChainGovernorConfig, 50)
+
+	// Governor status
+	govStatus := make(chan *gossipv1.SignedChainGovernorStatus, 50)
 	// Bootstrap guardian set, otherwise heartbeats would be skipped
 	// TODO: fetch this and probably figure out how to update it live
 	gst.Set(&common.GuardianSet{
@@ -200,6 +208,7 @@ func main() {
 			case <-rootCtx.Done():
 				return
 			case hb := <-heartbeatC:
+				logger.Info("found hearbeat!")
 				id := hb.GuardianAddr
 				now := time.Now()
 				update := bson.D{{Key: "$set", Value: hb}, {Key: "$set", Value: bson.D{{Key: "updatedAt", Value: now}}}, {Key: "$setOnInsert", Value: bson.D{{Key: "createdAt", Value: now}}}}
@@ -208,6 +217,61 @@ func main() {
 
 				if err != nil {
 					logger.Error("Error inserting heartbeat", zap.Error(err))
+				}
+			}
+		}
+	}()
+
+	// Log Governor cfg updates
+	go func() {
+		for {
+			select {
+			case <-rootCtx.Done():
+				return
+			case govC := <-govCfg:
+				logger.Debug("found gov cfg!")
+				id := hex.EncodeToString(govC.GuardianAddr)
+				now := time.Now()
+				var cfg gossipv1.ChainGovernorConfig
+				err := proto.Unmarshal(govC.Config, &cfg)
+				if err != nil {
+					logger.Error("Error unmarshalling govr config", zap.Error(err))
+					continue
+				}
+				update := bson.D{{Key: "$set", Value: govC}, {Key: "$set", Value: bson.D{{Key: "parsedConfig", Value: cfg}}}, {Key: "$set", Value: bson.D{{Key: "updatedAt", Value: now}}}, {Key: "$setOnInsert", Value: bson.D{{Key: "createdAt", Value: now}}}}
+				opts := options.Update().SetUpsert(true)
+				_, err2 := govCfgColl.UpdateByID(context.TODO(), id, update, opts)
+
+				if err2 != nil {
+					logger.Error("Error inserting govr cfg", zap.Error(err2))
+				}
+			}
+		}
+	}()
+
+	// Log Governor status updates
+	go func() {
+		for {
+			select {
+			case <-rootCtx.Done():
+				return
+			case govS := <-govStatus:
+				logger.Debug("found gov status!")
+				id := hex.EncodeToString(govS.GuardianAddr)
+				now := time.Now()
+				var status gossipv1.ChainGovernorStatus
+				err := proto.Unmarshal(govS.Status, &status)
+				if err != nil {
+					logger.Error("Error unmarshalling govr status", zap.Error(err))
+					continue
+				}
+				update := bson.D{{Key: "$set", Value: govS}, {Key: "$set", Value: bson.D{{Key: "parsedStatus", Value: status}}}, {Key: "$set", Value: bson.D{{Key: "updatedAt", Value: now}}}, {Key: "$setOnInsert", Value: bson.D{{Key: "createdAt", Value: now}}}}
+
+				opts := options.Update().SetUpsert(true)
+				_, err2 := govStatusColl.UpdateByID(context.TODO(), id, update, opts)
+
+				if err2 != nil {
+					logger.Error("Error inserting govr status", zap.Error(err2))
 				}
 			}
 		}
@@ -222,7 +286,7 @@ func main() {
 
 	// Run supervisor.
 	supervisor.New(rootCtx, logger, func(ctx context.Context) error {
-		if err := supervisor.Run(ctx, "p2p", p2p.Run(obsvC, obsvReqC, nil, sendC, signedInC, priv, nil, gst, p2pPort, p2pNetworkID, p2pBootstrap, "", false, rootCtxCancel, nil)); err != nil {
+		if err := supervisor.Run(ctx, "p2p", p2p.Run(obsvC, obsvReqC, nil, sendC, signedInC, priv, nil, gst, p2pPort, p2pNetworkID, p2pBootstrap, "", false, rootCtxCancel, nil, govCfg, govStatus)); err != nil {
 			return err
 		}
 
